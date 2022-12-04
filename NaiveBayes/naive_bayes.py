@@ -119,4 +119,5 @@ feature_values = get_feature_values(training_data, features)
 feature_count = get_class_feature_count(training_data, feature_values)
 feature_prob = calculate_feature_prob(class_count, feature_count)
 
-predict(test_data, feature_prob, features)
+if __name__ == '__main__':
+    predict(test_data, feature_prob, features)
