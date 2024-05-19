@@ -1,0 +1,569 @@
+---
+title: "Linear Model for Predicting House Prices"
+author: "Qi Chen, Prashanth Shankarappa, Matthew Smith"
+date: "7/29/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, message = FALSE, warning = FALSE}
+options(scipen = 1, digits = 10, width = 80, fig.alin = "center")
+
+```
+
+```{r include=FALSE, message = FALSE, warning = FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+library(lmtest)
+library(readr)
+library(data.table)
+library(faraway)
+library(MASS)
+library(broom)
+```
+
+
+```{r include=FALSE, message = FALSE, warning = FALSE}
+get_num_params = function(model) {
+  length(coef(model))
+}
+
+get_loocv_rmse = function(model) {
+  sqrt(mean((resid(model) / (1 - hatvalues(model))) ^ 2))
+}
+
+get_adj_r2 = function(model) {
+  summary(model)$adj.r.squared
+}
+
+get_partial_correlation = function(small_model, full_model){
+  cor(resid(small_model), resid(full_model))
+}
+
+get_rmse  = function(actual, predicted) {
+  sqrt(mean((actual - predicted) ^ 2))
+}
+```
+
+## Introduction
+
+Home prices are of obvious and immediate interest to all three of us from a personal and financial perspective. The real estate market has short- and long-term impacts on lifestyle and financial decisions we make for our families. Empirically, many variables have been used to price a house. Some common predictors are number of bedrooms or bathrooms, square footage, or year built. How do these and other predictors influence the price of a house? Could there be an interplay between predictors that would help with our prediction?
+
+Our housing data comes from [Kaggle](https://www.kaggle.com/harlfoxem/housesalesprediction). This dataset contains house sale prices for King County, which includes Seattle. It includes homes sold between May 2014 and May 2015.
+
+The following are variables in the dataset:
+
+-   `price` - Price of house as "Response"
+-   `bedrooms` - Number of bedrooms in a house
+-   `bathrooms` - Number of bathrooms in a house
+-   `sqft_lot` - Square footage of entire lot of house
+-   `floors` - Number of floors from 1 to 3.5
+-   `waterfront` - House is overlooking a waterfront
+-   `view` - House has a good view
+-   `condition` - Condition of the house from 1 to 5
+-   `grade` - Grade based on construction and design ranging from 1 to 13
+-   `sqft_above` - Number of bedrooms in a house
+-   `sqft_basement` - Square footage of basement area
+-   `lat` - Latitude
+-   `long` - Longitude
+-   `sqft_living15` - Average square footage of living area for nearest 15 neighbors
+-   `sqft_lot15` - Average square footage of lot of nearest 15 neighbors
+-   `yr_built` - Year when house was built
+-   `yr_renovated` - Year house was last renovated
+
+------------------------------------------------------------------------
+
+## Methods
+
+### Loading and Cleaning the Data
+
+Credit to [David Arenburg](https://stackoverflow.com/questions/24011246/deleting-rows-that-are-duplicated-in-one-column-based-on-the-conditions-of-anoth) for the approach we used here to eliminate duplicate houses.
+
+```{r, message=FALSE}
+houses = read_csv("kc_house_data.csv")
+
+# Create new variables "age" and "yrs_since_renovation"
+houses$age = 2021 - houses$yr_built
+houses$yrs_since_renovation = ifelse(houses$yr_renovated == 0, houses$age, 2021 - houses$yr_renovated)
+
+# Some houses were sold twice in the period covered by this dataset. For simplicity and accuracy, we will keep only the most recent sale of a home. Houses with the same "id" are the same.
+houses = unique(setDT(houses)[order(id, -date)], by = "id")
+
+# Remove variables that will not be used in model
+houses = subset(houses, select=-c(id, date, yr_built, yr_renovated, zipcode))
+
+# Remove houses with prices less than or equal to zero
+houses = houses[which(houses$price > 0.0),]
+houses = houses[which(houses$bedrooms > 0.0),]
+houses = houses[which(houses$bathrooms > 0.0),]
+
+# Remove the 1620-sqft house that allegedly has 33 bedrooms with 1.75 bathrooms; this observation needs to be removed now, and not in the influential observations step, because it would be *so* influential on the additive model that it would keep other influential points from being identified as such
+houses = houses[which(houses$bedrooms < 33),]
+
+# There is an exact collinear relationship between sqft_living, sqft_above, and sqft_basement; remove sqft_living from the dataset
+coef(lm(price~sqft_living+sqft_above+sqft_basement, data=houses))
+houses = subset(houses, select=-c(sqft_living))
+```
+
+We also split data into test and training sets
+
+
+- Training set: Model is fit using this data. `70%` is allocated as training set. 
+- Test set: Model will be evaluated using this data. `30%` is allocated as test set.
+
+```{r, message=FALSE}
+# Split the data between test and train
+set.seed(20210804)
+train_idx = sample(1:nrow(houses), nrow(houses) * 0.7)
+houses_train = houses[train_idx,]
+houses_test = houses[-train_idx,]
+
+```
+
+### Data Exploration
+
+#### Influential Points
+
+To determine if any observations are "influential" (based on Cook's Distance) and therefore might have an outsized impact on the model, we need to build a model first. For this purpose, we will use a simple additive model with all available predictors.
+
+```{r warning = FALSE}
+# Additive model with all available predictors
+#**Prashanth- Updated-8/5
+houses_full_add_model = lm(price~., data=houses)
+summary(houses_full_add_model)$adj.r.squared
+#summary(lm(price~., data=houses))$adj.r.squared
+
+# Remove influential points from the original dataset
+#**Prashanth- Updated-8/5 - to include less than and equal to
+#houses_noninf = houses[cooks.distance(lm(price~., data=houses)) < 4 / nrow(houses)]
+houses_noninf = houses[cooks.distance(houses_full_add_model) <= 4 / nrow(houses)]
+
+# Fit an additive model without the influential observations
+summary(lm(price~., data=houses_noninf))$adj.r.squared
+```
+
+We see that before removing influential observations, a simple additive model explained about $69.6\%$ of the variation in the data. After removing influential observations, which made up about $5.4\%$ of the data, a simple additive model now explains about $76.3\%$ of the variation in the data.
+
+#### Correlated Predictors
+
+The most highly-correlated predictors are `yrs_since_renovation` and `age`:
+
+```{r warning=FALSE}
+corr = as.matrix(cor(houses_noninf))
+which(corr == max(corr[corr<1]), arr.ind = TRUE)
+round(max(corr[corr<1]),2)
+```
+
+Several other pairs of predictors are correlated at some level above $0.70$, with none above $0.79$:
+
+```{r warning=FALSE}
+which(round(corr,2) >= 0.70 & round(corr,3) < 0.927, arr.ind = TRUE)
+```
+
+Finally, we observe that `grade`, `sqft_living15`, and `sqft_above` are the predictors most highly-correlated with the response `price`:
+
+```{r warning=FALSE}
+sort(corr["price",], decreasing=TRUE)[sort(corr["price",], decreasing=TRUE) < 1.00]
+```
+
+#### Factor Variables
+
+The variable waterfront is a categorical variable and should be coerced into a factor. This needed to happen after we completed the correlation analysis.
+
+```{r warning=FALSE}
+houses$waterfront = as.factor(houses$waterfront)
+```
+
+
+```{r warning=FALSE, include=FALSE}
+#**Prashanth - added 8/5 - after coercing to factor, we can split into training and testing and refit additive model
+set.seed(20210804)
+train_idx = sample(1:nrow(houses), nrow(houses) * 0.8)
+houses_train = houses[train_idx, ]
+houses_test = houses[-train_idx, ]
+houses_full_add_model = lm(price ~ ., data = houses_train)
+
+```
+
+---
+
+### Model Building
+
+#### Model selection methods
+
+There are different model search methods that can be used - backward, forward, stepwise, or exhaustive search. We can also use different quality criteria to select a good model - AIC, BIC, Adjusted $R^{2}$, or Cross Validation. Below we compare backward search with AIC and exhaustive search methods. We compare these methods and quality criteria in the context of Additive model that we created earlier.
+
+```{r include= FALSE, warning=FALSE}
+library(leaps)
+mod_start = lm(price ~ 1, data = houses_train)
+
+houses_forw_aic_mod = step(
+  mod_start,
+  scope = price ~ bedrooms + bathrooms + sqft_lot + floors + waterfront + view + condition + grade + sqft_above + sqft_basement + lat + long + sqft_living15 + sqft_lot15 + age + yrs_since_renovation,
+  direction = "forward",
+  trace = 0
+)
+
+houses_back_aic_mod = step(houses_full_add_model,
+                           direction = "backward",
+                           trace = 0)
+
+all_houses_mod = summary(regsubsets(price ~ ., data = houses_train, nvmax =
+                                      length(coef(
+                                        houses_full_add_model
+                                      ))))
+p = length(coef(houses_full_add_model))
+n = length(resid(houses_full_add_model))
+all_houses_mod_aic = (n * log(all_houses_mod$rss / n)) + (2:p)
+best_aic_ind = which.min(all_houses_mod_aic)
+
+num_params_forw_aic_mod = length(coef(houses_forw_aic_mod))
+num_params_back_aic_mod = length(coef(houses_back_aic_mod))
+num_params_all_mod = which.min(all_houses_mod_aic)
+
+adjr2_forw_aic_mod = round(summary(houses_forw_aic_mod)$adj.r.squared, 4)
+adjr2_aic_mod = round(summary(houses_back_aic_mod)$adj.r.squared, 4)
+adjr2_all_mod = round(max(all_houses_mod$adjr2[which.min(all_houses_mod_aic)]), 4)
+
+aic_forw = round(extractAIC(houses_forw_aic_mod, k = log(length(
+  houses_back_aic_mod
+)))[2], 4)
+aic_back = round(extractAIC(houses_back_aic_mod, k = log(length(
+  houses_back_aic_mod
+)))[2], 4)
+bic_all_mod = round(min(all_houses_mod_aic), 4)
+```
+
+
+```{r warning=FALSE}
+df = cbind(
+  "Forward AIC Search" = c(num_params_forw_aic_mod, adjr2_forw_aic_mod, forw_aic_mod),
+  "Back AIC Search" = c(num_params_aic_mod, adjr2_aic_mod, bic_aic_mod),
+  "Exhaustive Search - Best" = c(num_params_all_mod, adjr2_all_mod, bic_all_mod)
+)
+
+row.names(df) = c("Num of params", "Adj R2", "Best AIC")
+kable(df, caption = "Compare Search methods - Forward & Backward AIC, and Exhaustive Search")
+
+```
+
+Comparing different search methods shows us that different models can be selected. Out of three search methods forward and backward AIC produce similar results and they have lowest BIC but higher Adj. $R^2$. Exhaustive search produces smaller model but with lower Adj. $R^2$. We further explore backward search with BIC and AIC to create more complex models using some of these search methods.
+
+
+
+#### Model A: Simpler, Explanatory Model (for Individual Buyer) Qi
+
+```{r}
+sim_model = lm(log(price) ~ sqft_above + sqft_basement + waterfront + grade + age + lat + view, data = houses_train)
+```
+
+#### Model B: Up to 2nd-degree polynomials, log(predictor), and 2-way interactions, forward search
+
+```{r eval=FALSE}
+fwd_poly2_log_mod = step(lm(price~1, data=houses_train), direction="forward", k=log(nrow(houses_train)), trace=0,
+           scope=price~(
+                        poly(bedrooms,2)+
+                        poly(bathrooms,2)+
+                        poly(sqft_lot,2)+
+                        poly(floors,2)+
+                        waterfront+
+                        poly(condition,2)+
+                        poly(grade,2)+
+                        poly(sqft_above,2)+
+                        poly(sqft_basement,2)+
+                        poly(lat,2)+
+                        poly(long,2)+
+                        poly(sqft_living15,2)+
+                        poly(sqft_lot15,2)+
+                        poly(age,2)+
+                        poly(yrs_since_renovation,2)+
+                        log(sqft_above)
+                        )^2
+          )
+```
+
+#### Model C: 2 way interaction with square of all the predictors using backward search (Prashanth)
+
+
+###### **Create a model with 2-way interaction and second degree polynomials.**
+
+```{r eval=FALSE}
+#Create a model with 2-way interation and second degree polynomials.
+
+col_names = names(houses_train)[!names(houses_train) %in% c("price", "waterfront")]
+fmla_2way_int = as.formula(paste(
+  "price ~ . ^2 + ",
+  sep = "",
+  paste("I(", col_names, sep = "", "^2)", collapse = "+")
+))
+
+int_poly2_model = lm(fmla_2way_int, data = houses_train)
+int_poly2_adjr2 = get_adj_r2(int_poly2_model)
+int_poly2_cvrmse = get_loocv_rmse(int_poly2_model)
+int_poly2_params = get_num_params(int_poly2_model)
+
+#Use Backwards selection using BIC to select the best model.
+int_poly2_bic_model = step(
+  int_poly2_model,
+  direction = "backward",
+  k = log(length(resid(int_poly2_model))),
+  trace = 0
+)
+
+#int_poly2_back_bic_model_predictoback_model$terms[[3]]
+fmla_int_poly2_model_terms = as.formula(int_poly2_bic_model$terms)
+
+int_poly2_back_bic_adjr2 = get_adj_r2(int_poly2_bic_model)
+int_poly2_back_bic_cvrmse = get_loocv_rmse(int_poly2_bic_model)
+int_poly2_back_bic_params = get_num_params(int_poly2_bic_model)
+
+```
+
+######  **Compare Additive model and Interactive polynomial model**
+
+```{r warning=FALSE, eval=FALSE}
+an_1 = anova(houses_full_add_model, int_poly2_bic_model)
+```
+
+We use ANOVA F-test to compare additive and interaction model. With a p-value of `` which is extremely small we prefer larger interaction model.
+
+######  **Identify influential points in training dataset for this model**
+
+```{r eval=FALSE}
+houses_train_inf = houses_train[cooks.distance(int_poly2_model) > 4 / nrow(houses_train)]
+num_of_inf = nrow(houses_train_inf)
+
+```
+
+There are `` observations that can be considered influential.
+
+###### **Remove influential points and fit model excluding influential points. Compare coefficients of the two models.**
+
+```{r eval=FALSE, include=FALSE}
+houses_train_noninf = houses_train[cooks.distance(int_poly2_model) <= 4 / nrow(houses_train)]
+int_poly2_model_noninf = lm(fmla_int_poly2_model_terms, data = houses_train_noninf)
+
+int_poly2_noninf_adjr2 = get_adj_r2(int_poly2_model_noninf)
+int_poly2_noninf_cvrmse = get_loocv_rmse(int_poly2_model_noninf)
+int_poly2_noninf_params = get_num_params(int_poly2_model_noninf)
+
+#Use Backwards selection using BIC to select the best model.
+int_poly2_back_bic_noninf_model = step(
+  int_poly2_model_noninf,
+  direction = "backward",
+  k = log(length(resid(
+    int_poly2_model_noninf
+  ))),
+  trace = 0
+)
+```
+
+
+```{r eval=FALSE}
+df_2 = cbind(
+  "Poly Model" = coef(int_poly2_back_bic_model),
+  "Poly Model-Non Infl" = coef(int_poly2_back_bic_noninf_model),
+  "Difference" = coef(int_poly2_back_bic_model) - coef(int_poly2_back_bic_noninf_model)
+)
+
+library(knitr)
+kable(df_2, caption = "Models Coefficients table")
+
+```
+
+
+
+
+##### Compare Full additive model and complex polynomial model
+
+```{r eval=FALSE}
+anova(houses_full_add_model, int_poly2_model)
+
+df_1 = cbind(
+  "Number of Parameters" = c(
+    get_num_params(houses_full_add_model),
+    get_num_params(int_poly2_back_bic_model)
+  ),
+  "LOOCV RMSE" = c(
+    get_loocv_rmse(houses_full_add_model),
+    get_loocv_rmse(int_poly2_back_bic_model)
+  ),
+  "Adj. R squared" = c(
+    get_adj_r2(houses_full_add_model),
+    get_adj_r2(int_poly2_back_bic_model)
+  )
+)
+row.names(df_1) = c("Full Additive", "Interaction Poly Backward Search")
+kable(df_1, caption = "Compare Full additive vs Backward BIC Polynomial Model")
+
+```
+
+#### Model D: 2 way interaction with square of all the predictor backward search with log transformation on response(Qi)
+
+```{r eval=FALSE}
+col_names = names(houses_train)[!names(houses_train) %in% c("price", "yrs_since_renovation", "waterfront")]
+fmla_2way_int_log = as.formula(paste(
+  "log(price) ~ . ^2 + ",
+  sep = "",
+  paste("I(", col_names, sep = "", "^2)", collapse = "+")
+))
+int_poly2_log_model = lm(fmla_2way_int_log, data = houses_train)
+
+#Use Backwards selection using BIC to select the best model.
+int_poly2_log_back_bic_model = step(
+  int_poly2_log_model,
+  direction = "backward",
+  k = log(length(resid(
+    int_poly2_log_model
+  ))),
+  trace = 0
+)
+
+```
+
+#### Model E: simple additive model backward search with log transformation on response(Qi)
+
+```{r eval=FALSE}
+log_add_model = lm(log(price) ~ ., data = houses_train)
+log_add_model_bic = step(
+  log_add_model,
+  direction = "backward",
+  k = log(length(resid(log_add_model))),
+  trace = 0
+)
+
+```
+
+
+---
+
+## Results
+
+### Test-Train Split Cross-Validation (Qi)
+
+```{r eval=FALSE}
+RMSE_train_sim_model = get_rmse(houses_train$price, predict(sim_model, houses_train))
+RMSE_train_forward_bic_model = get_rmse(houses_train$price, predict(fwd_poly2_log_mod, houses_train))
+RMSE_train_back_bic_model = get_rmse(houses_train$price,
+                                     predict(int_poly2_back_bic_model, houses_train))
+RMSE_train_log_int_model_bic = get_rmse(houses_train$price, exp(predict(
+  int_poly2_log_back_bic_model, houses_train
+)))
+RMSE_train_log_add_model_bic = get_rmse(houses_train$price, exp(predict(log_add_model_bic, houses_train)))
+
+RMSE_test_sim_model = get_rmse(houses_test$price, predict(sim_model, houses_test))
+RMSE_test_forward_bic_model = get_rmse(houses_test$price, predict(fwd_poly2_log_mod, houses_test))
+RMSE_test_back_bic_model = get_rmse(houses_test$price,
+                                    predict(int_poly2_back_bic_model, houses_test))
+RMSE_test_log_int_model_bic = get_rmse(houses_test$price, exp(predict(
+  int_poly2_log_back_bic_model, houses_test
+)))
+RMSE_test_log_add_model_bic = get_rmse(houses_test$price, exp(predict(log_add_model_bic, houses_test)))
+
+results = data.frame(
+  "Model" = c(
+    "Simple",
+    "Poly Forward",
+    "Poly Backward",
+    "Log Poly",
+    "Log Additive"
+  ),
+  "Train RMSE" = c(
+    RMSE_train_sim_model,
+    RMSE_train_forward_bic_model,
+    RMSE_train_back_bic_model,
+    RMSE_train_log_int_model_bic,
+    RMSE_train_log_add_model_bic
+  ),
+  "Test RMSE" = c(
+    RMSE_test_sim_model,
+    RMSE_test_forward_bic_model,
+    RMSE_test_back_bic_model,
+    RMSE_test_log_int_model_bic,
+    RMSE_test_log_add_model_bic
+  ),
+  "Adj. R.squared" = c(
+    get_adj_r2(sim_model),
+    get_adj_r2(fwd_poly2_log_mod),
+    get_adj_r2(int_poly2_back_bic_model),
+    get_adj_r2(int_poly2_log_back_bic_model),
+    get_adj_r2(log_add_model_bic)
+  ),
+  "Number of Parameters" = c(
+    length(coef(sim_model)),
+    length(coef(fwd_poly2_log_mod)),
+    length(coef(int_poly2_back_bic_model)),
+    length(coef(int_poly2_log_back_bic_model)),
+    length(coef(log_add_model_bic))
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(results)
+```
+
+Assumptions validation(Prashanth)
+
+```{r include=FALSE, message = FALSE, warning = FALSE}
+diagnostics = function(model,
+                       pcol = "grey",
+                       lcol = "dodgerblue",
+                       alpha = 0.01,
+                       plotit = TRUE,
+                       testit = TRUE) {
+
+  model_name = substitute(model)
+  if (plotit == TRUE) {
+    plot(
+      fitted(model),
+      resid(model),
+      col = pcol,
+      pch = 20,
+      xlab = "Fitted",
+      ylab = "Residuals",
+      #main = paste("Residual vs Fitted for", gsub("()", "", model$call["data"]), "of", model_name)
+      main = paste("Residual vs Fitted from model -", toupper(model_name))
+    )
+    abline(h = 0, col = lcol, lwd = 2)
+    
+    qqnorm(resid(model),
+           main = paste("Normal Q-Q Plot from model -", toupper(model_name)),
+           col = pcol)
+    qqline(resid(model), col = lcol, lwd = 2)
+    
+  }
+  
+  if (testit == TRUE) {
+    shapiro_p_val = shapiro.test(resid(model))$"p.value"
+    shapiro_decision = ifelse(shapiro_p_val < alpha, "Reject", "Fail to Reject")
+    bptest_p_val = bptest(model)$"p.value"
+    bptest_decision = ifelse(bptest_p_val < alpha, "Reject", "Fail to Reject")
+    result = cbind(
+      "Shapiro Wilk Test" = c(shapiro_p_val,shapiro_decision),
+      "BP Test" = c(bptest_p_val, bptest_decision)
+    )
+    row.names(result) = c("P-Value", "Result")
+    return(result)
+  }
+}
+
+```
+
+
+```{r figures-side, fig.show="hold", out.width="50%", eval=FALSE}
+diagnostics(sim_model, plotit = T, testit = F)
+diagnostics(fwd_poly2_log_mod, plotit = T, testit = F)
+diagnostics(int_poly2_back_bic_model, plotit = T, testit = F)
+diagnostics(int_poly2_log_back_bic_model, plotit = T, testit = F)
+
+```
+
+
+---
+
+## Discussion
+
+We notice that the max $R^2$ we can get is around 85%. This make us believe that some critical data that is not included in this data set may play a important factor on the house prices. For example, based on our common sense, the school grade is also a important factor on the house prices. For further research, we can get school grade data for each house and use it in our models.
+
+None of our models passed either the Shapiro-Wilk test for normality or the Breusch-Pagan test for constant variance. Additionally, all of our fitted vs. residuals plots indicate problems with the linearity assumption.

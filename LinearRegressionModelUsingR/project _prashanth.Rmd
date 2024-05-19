@@ -1,0 +1,351 @@
+---
+title: "Linear Model for Predicting House Prices"
+author: "Qi Chen, Prashanth Shankarappa, Matthew Smith"
+date: "7/29/2021"
+output:
+  html_document: 
+    theme: readable
+    toc: yes
+  pdf_document: default
+urlcolor: cyan
+---
+
+------------------------------------------------------------------------
+
+```{r setup, message = FALSE, warning = FALSE}
+options(scipen = 10, digits = 10, width = 80, fig.align = "center")
+library("knitr")
+library("lmtest")
+library("faraway")
+library("MASS")
+library("broom")
+```
+
+```{r setup, message = FALSE, warning = FALSE}
+diagnostics = function(model,
+                       pcol = "grey",
+                       lcol = "dodgerblue",
+                       alpha = 0.01,
+                       plotit = TRUE,
+                       testit = TRUE) {
+
+  model_name = substitute(model)
+  if (plotit == TRUE) {
+    plot(
+      fitted(model),
+      resid(model),
+      col = pcol,
+      pch = 20,
+      xlab = "Fitted",
+      ylab = "Residuals",
+      #main = paste("Residual vs Fitted for", gsub("()", "", model$call["data"]), "of", model_name)
+      main = paste("Residual vs Fitted from model -", toupper(model_name))
+    )
+    abline(h = 0, col = lcol, lwd = 2)
+    
+    qqnorm(resid(model),
+           main = paste("Normal Q-Q Plot from model -", toupper(model_name)),
+           col = pcol)
+    qqline(resid(model), col = lcol, lwd = 2)
+    
+  }
+  
+  if (testit == TRUE) {
+    shapiro_p_val = shapiro.test(resid(model))$"p.value"
+    shapiro_decision = ifelse(shapiro_p_val < alpha, "Reject", "Fail to Reject")
+    bptest_p_val = bptest(model)$"p.value"
+    bptest_decision = ifelse(bptest_p_val < alpha, "Reject", "Fail to Reject")
+    result = cbind(
+      "Shapiro Wilk Test" = c(shapiro_p_val,shapiro_decision),
+      "BP Test" = c(bptest_p_val, bptest_decision)
+    )
+    row.names(result) = c("P-Value", "Result")
+    return(result)
+  }
+}
+
+
+get_num_params = function(model) {
+  length(coef(model))
+}
+
+get_loocv_rmse = function(model) {
+  sqrt(mean((resid(model) / (1 - hatvalues(model))) ^ 2))
+}
+
+get_adj_r2 = function(model) {
+  summary(model)$adj.r.squared
+}
+
+get_partial_correlation = function(small_model, full_model){
+  cor(resid(small_model), resid(full_model))
+}
+
+
+
+```
+
+```{r message=FALSE, warning=FALSE}
+library(readr)
+houses = read_csv("kc_house_data.csv")
+
+# Create new variables "age" and "yrs_since_renovation"
+houses$age = 2015 - houses$yr_built
+houses$yrs_since_renovation = ifelse(houses$yr_renovated == 0, houses$age, 2015 - houses$yr_renovated)
+
+# Remove variables "date", "yr_built", "yr_renovated" and "zipcode"
+houses = subset(houses, select=-c(date, yr_built, yr_renovated, id, zipcode))
+houses = houses[which(houses$price > 0.0),]
+#houses = subset(houses, select=-c(sqft_basement))
+
+# Split the data between test and train
+set.seed(20210804)
+train_idx = sample(1:nrow(houses), nrow(houses) * 0.8)
+houses_train = houses[train_idx,]
+houses_test = houses[-train_idx,]
+
+
+houses$waterfront = as.factor(houses$waterfront)
+set.seed(20210804)
+train_idx = sample(1:nrow(houses), nrow(houses) * 0.8)
+houses_train = houses[train_idx,]
+houses_test = houses[-train_idx,]
+houses_full_add_model = lm(price~., data=houses_train)
+
+```
+
+##### We now fit an additive model and verify significance of regression and significance of predictors.
+
+```{r warning=FALSE}
+full_add_model = lm(price ~.,data = houses_train)
+summary(full_add_model)
+get_num_params(full_add_model)
+```
+
+We see that Regression by the way of F-Test is significant but some individual predictors are not. This could indicate collinearity between predictors. Also notice that sqft_basement is excluded from model probably because of exact collinearity.
+
+-   Use collinearity matrix to check correlation between predictors
+
+```{r warning=FALSE}
+#pairs(houses_train)
+round(cor(houses_train), 2)
+
+```
+
+Predictors "yrs\_since\_renovation" and "age" have highest collinearity followed by "sqft\_above" and "sqft\_living".
+
+-   Checking Variance inflation factor we see that for small changes in predictors beta\_hat values could increase significantly.
+
+```{r warning=FALSE}
+vif(full_add_model)
+
+```
+
+-   Check Partial correlation coefficient for yrs\_since\_renovation and sqft\_living against price
+
+```{r warning=FALSE}
+t_houses = subset(houses_train, select = -c(price))
+
+yrs_since_renovation_model = lm(yrs_since_renovation ~ . - sqft_living, data = t_houses)
+small_model = lm(price ~ . - yrs_since_renovation, data = houses_train)
+get_partial_correlation(small_model, yrs_since_renovation_model)
+
+sqft_living_model = lm(sqft_living ~ . - yrs_since_renovation, data = t_houses)
+small_model = lm(price ~ . - sqft_living, data = houses_train)
+get_partial_correlation(small_model, sqft_living_model)
+
+summary(yrs_since_renovation_model)$r.squared
+summary(sqft_living_model)$r.squared
+
+```
+
+For "yrs\_since\_renovation\_model" and "sqft\_living" $R^2$ is high which means that rest of predictors explain
+
+#### Option 1: Dealing with Collinearity - Remove preditors
+
+
+-   Remove "yrs\_since\_renovation" and "sqft\_living" from the data and fit the model again
+
+```{r}
+houses_train$waterfront = as.factor(houses_train$waterfront)
+full_add_model = lm(price ~.,data = houses_train)
+get_adj_r2(full_add_model)
+get_loocv_rmse(full_add_model)
+length(coef(full_add_model))
+
+
+new_houses_train_cor = subset(houses_train, select = -c(yrs_since_renovation, sqft_living))
+full_add_model_cor = lm(price ~ ., data = new_houses_train_cor)
+vif(full_add_model_cor)
+
+get_adj_r2(full_add_model_cor)
+get_loocv_rmse(full_add_model_cor)
+length(coef(full_add_model_cor))
+
+```
+
+-   Variable selection using BIC
+
+```{r}
+back_bic_model = step(full_add_model, direction = "backward", k = log(length(resid(full_add_model))), trace = 0)
+
+names(coef(back_bic_model))
+get_adj_r2(back_bic_model)
+get_loocv_rmse(back_bic_model)
+length(coef(back_bic_model))
+
+
+```
+
+-   Perform ANOVA to test new back\_bic\_model vs new\_full\_add\_model. We can conclude that we prefer the smaller "back\_bic\_model" model
+
+```{r warning=FALSE}
+anova(back_bic_model, full_add_model)
+```
+
+-   Remove any influential points
+
+```{r}
+cd_houses = cooks.distance(back_bic_model)
+cd_vector_non_infl = cooks.distance(back_bic_model) <= 4 / length(cooks.distance(back_bic_model))
+houses_train_non_infl = houses_train[cd_vector_non_infl,]
+```
+
+```{r}
+full_add_inf_model = lm(price ~ ., data = houses_train, subset = cooks.distance(back_bic_model) <= 4 / length(cooks.distance(back_bic_model)))
+get_adj_r2(full_add_inf_model)
+get_loocv_rmse(full_add_inf_model)
+
+```
+
+```{r}
+
+houses_df = cbind(
+  "New Houses Model" = coef(full_add_inf_model),
+  "Full Houses Model" = coef(full_add_inf_model),
+  "Difference" = coef(full_add_inf_model) - coef(full_add_model)
+)
+
+library(knitr)
+kable(houses_df, caption = "Models Coefficients table")
+
+```
+
+
+-   Fit a full additive model and small additive model. Full model has higher Adj. R squared and lower RMSE than small model, we prefer the larger additive model.
+
+```{r}
+
+full_add_model = lm(price ~ ., data = new_houses_train)
+small_add_model = lm(price ~ grade + age + sqft_living, data = new_houses_train)
+anova(small_add_model, full_add_model)
+
+df_1 = cbind(
+  "LOOCV RMSE" = c(get_loocv_rmse(small_add_model),get_loocv_rmse(full_add_model)),
+  "Adj. R squared" = c(get_adj_r2(small_add_model),get_adj_r2(full_add_model))
+)
+row.names(df_1) = c("Small","Full")
+kable(df_1, caption = "Compare Full vs Small Model")
+
+```
+
+-   Remove any influential points
+
+```{r}
+cd_houses = cooks.distance(back_bic_model)
+cd_vector_non_infl = cooks.distance(back_bic_model) <= 4 / length(cooks.distance(back_bic_model))
+
+new_houses = new_houses[cd_vector_non_infl,]
+
+new_full_add_fix = lm(price ~ ., data = new_houses)
+get_adj_r2(new_full_add_fix)
+get_loocv_rmse(new_full_add_fix)
+
+```
+
+-   Compare models after removing influential points
+
+```{r}
+compare_df = cbind(
+  "Full Add Model" = coef(full_add_model),
+  "New Full Add Model" = coef(full_add_fix),
+  "Difference" = coef(full_add_model) - coef(full_add_fix)
+)
+
+library(knitr)
+kable(compare_df, caption = "Models Coefficients table")
+```
+
+
+```{r}
+plot(houses_train$price, type = "p", pch = 1.5, col = "dodgerblue", xlab = "Density", ylab = "Price")
+
+```
+
+
+### Perform Variance stabilization transformation - Log transformation
+
+```{r}
+library(leaps)
+all_hipcenter_mod = summary(regsubsets(price ~ ., data = houses_train))
+all_hipcenter_mod$which
+all_hipcenter_mod$rss
+all_hipcenter_mod$adjr2
+
+```
+
+
+```{r}
+
+model = lm(price ~ .+I(age^2), data = houses_train)
+
+#model = lm((price^(-0.1)-1)/0.1 ~ view+waterfront+(sqft_living+grade+lat+age)^3+I(floors^2)+I(bathrooms^2), data = houses_train)
+back_model = step(model, direction = "backward", k = log(length(resid(model))), trace = 0)
+
+model = lm(formula = as.formula(back_model$terms), data = houses_train)
+
+get_adj_r2(model)
+get_loocv_rmse(model)
+get_num_params(model)
+
+get_adj_r2(back_model)
+get_loocv_rmse(back_model)
+get_num_params(back_model)
+
+names(model$coefficients)[!names(model$coefficients) %in% names(back_model$coefficients)]
+
+boxcox(savings_model, plotit = TRUE, lambda = seq(0.5, 1.5, by = 0.1))
+
+
+
+```
+
+##### Model selection methods
+
+
+```{r}
+library(leaps)
+all_hipcenter_mod = summary(regsubsets(price ~ ., data = houses_train, method=c("exhaustive", "backward", "forward", "seqrep")))
+all_hipcenter_mod$which
+all_hipcenter_mod$rss
+all_hipcenter_mod$adjr2
+
+model_back_aic = step(full_add_model, direction = "backward", trace = 0)
+model_back_bic = step(full_add_model, direction = "backward", trace = 0, k = log(length(resid(full_add_model))))
+model_back_aic$terms[[3]]
+model_back_bic$terms[[3]]
+all_hipcenter_mod$which
+
+model_back_aic$adjr2
+model_back_bic$adjr2
+all_hipcenter_mod$adjr2
+
+extractAIC(model_back_aic, k = log(length(model_back_aic)))
+extractAIC(model_back_bic, k = log(length(model_back_bic)))
+best_bic_ind = which.min(all_hipcenter_mod$bic)
+sum(all_hipcenter_mod$which[best_bic_ind,])
+
+```
+
+
+
